@@ -1,0 +1,25 @@
+body { font-family: Arial, sans-serif; margin: 0; background: #f4f6f8; }
+header { background: #b71c1c; color: #fff; padding: 1rem 2rem; }
+main { max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+.ok { color: #2e7d32; }
+.fail { color: #c62828; }
+
+/* --- Added for Labs 2-10 --- */
+main { max-width: 1000px; }
+nav { background: #8e1515; padding: .5rem 2rem; display: flex; flex-wrap: wrap; gap: 1rem; }
+nav a { color: #fff; text-decoration: none; font-size: .95rem; }
+nav a:hover { text-decoration: underline; }
+form, .card { background: #fff; padding: 1rem; border-radius: 6px; margin-bottom: 1.5rem; box-shadow: 0 1px 3px #0002; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .8rem; }
+label { display: block; font-size: .85rem; font-weight: bold; }
+input, select, textarea { width: 100%; box-sizing: border-box; padding: .45rem; margin-top: .2rem; border: 1px solid #bbb; border-radius: 4px; font: inherit; }
+button { background: #b71c1c; color: #fff; border: 0; padding: .5rem 1rem; border-radius: 4px; cursor: pointer; margin-top: .8rem; }
+button.sec { background: #607d8b; padding: .25rem .6rem; margin: 0; }
+table { width: 100%; border-collapse: collapse; background: #fff; font-size: .9rem; }
+th, td { padding: .5rem; border-bottom: 1px solid #ddd; text-align: left; }
+th { background: #eceff1; }
+.table-wrap { overflow-x: auto; }
+.msg { min-height: 1.2rem; font-weight: bold; }
+.badge { padding: 2px 8px; border-radius: 10px; font-size: .78rem; background: #cfd8dc; }
+.Critical, .High { background: #ffcdd2; } .Medium { background: #ffe0b2; } .Low, .Resolved, .Active { background: #c8e6c9; }
+.Inactive { background: #e0e0e0; }

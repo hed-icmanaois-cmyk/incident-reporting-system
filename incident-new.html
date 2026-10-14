@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Report Incident | Incident Reporting System</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header><h1>🚨 Report Incident</h1></header>
+  <main>
+    <form id="form">
+      <div class="grid">
+        <label>Reporter *<select id="reporter_id"></select></label>
+        <label>Category *<select id="category_id"></select></label>
+        <label>Incident Type *<select id="type_id"></select></label>
+        <label>Location<select id="location_id"></select></label>
+        <label>Date of Incident *<input type="date" id="incident_date"></label>
+        <label>Time of Incident *<input type="time" id="incident_time"></label>
+        <label>Severity *<select id="severity"><option value="">-- Select --</option><option>Low</option><option>Medium</option><option>High</option><option>Critical</option></select></label>
+      </div>
+      <label>Description *<textarea id="description" rows="4"></textarea></label>
+      <label>Immediate Response<textarea id="immediate_response" rows="2"></textarea></label>
+      <button>Save Incident</button>
+      <p id="msg" class="msg"></p>
+    </form>
+  </main>
+  <script src="js/config.js"></script>
+  <script src="js/db.js"></script>
+  <script src="js/common.js"></script>
+  <script src="js/incident-new.js"></script>
+</body>
+</html>

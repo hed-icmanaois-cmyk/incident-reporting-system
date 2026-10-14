@@ -4,54 +4,18 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Incident Reporting System</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 0; background: #f4f6f8; }
-    header { background: #b71c1c; color: #fff; padding: 1rem 2rem; }
-    main { max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
-    .ok { color: #2e7d32; }
-    .fail { color: #c62828; }
-  </style>
+  <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
   <header><h1>🚨 Incident Reporting System</h1></header>
   <main>
     <p>Welcome! Report and track incidents in one place.</p>
-    <p>Database status: <strong id="status">Checking...</strong></p>
-    <p>Incidents stored: <strong id="count">-</strong></p>
+    <p>Database status: <strong id="dbStatus">Checking...</strong></p>
+    <p>Incidents stored: <strong id="dbCount">-</strong></p>
+    <p>Relationship test: <strong id="dbRel">-</strong></p>
   </main>
-
-  <script>
-    // Database settings
-    const DB_NAME = "IncidentReportingDB";
-    const DB_VERSION = 1;
-    const STORE = "incidents";
-
-    const statusEl = document.getElementById("status");
-    const countEl = document.getElementById("count");
-
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-    // Runs the first time: creates the table (object store)
-    request.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      db.createObjectStore(STORE, { keyPath: "id", autoIncrement: true });
-    };
-
-    // Connection test
-    request.onsuccess = (e) => {
-      const db = e.target.result;
-      statusEl.textContent = "Connected";
-      statusEl.className = "ok";
-      console.log("✅ Database connected");
-
-      const countReq = db.transaction(STORE).objectStore(STORE).count();
-      countReq.onsuccess = () => { countEl.textContent = countReq.result; };
-    };
-
-    request.onerror = () => {
-      statusEl.textContent = "Not connected";
-      statusEl.className = "fail";
-    };
-  </script>
+  <script src="js/config.js"></script>
+  <script src="js/db.js"></script>
+  <script src="js/common.js"></script>
 </body>
 </html>

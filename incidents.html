@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Incident Monitoring | Incident Reporting System</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header><h1>🚨 Incident Monitoring</h1></header>
+  <main>
+    <div class="card grid">
+      <label>Incident No.<input id="q_no" oninput="render()"></label>
+      <label>Reporter<input id="q_rep" oninput="render()"></label>
+      <label>Category<select id="f_cat" onchange="catChange()"></select></label>
+      <label>Type<select id="f_type" onchange="render()"></select></label>
+      <label>Date<input type="date" id="f_date" onchange="render()"></label>
+      <label>Severity<select id="f_sev" onchange="render()"><option value="">All</option><option>Low</option><option>Medium</option><option>High</option><option>Critical</option></select></label>
+      <label>Status<select id="f_stat" onchange="render()"><option value="">All</option><option>Open</option><option>Under Investigation</option><option>Resolved</option><option>Closed</option></select></label>
+    </div>
+    <p id="count"></p>
+    <div class="table-wrap"><table><thead><tr><th>Incident No.</th><th>Reporter</th><th>Category</th><th>Type</th><th>Date</th><th>Severity</th><th>Status</th></tr></thead><tbody id="rows"></tbody></table></div>
+  </main>
+  <script src="js/config.js"></script>
+  <script src="js/db.js"></script>
+  <script src="js/common.js"></script>
+  <script src="js/incidents.js"></script>
+</body>
+</html>
