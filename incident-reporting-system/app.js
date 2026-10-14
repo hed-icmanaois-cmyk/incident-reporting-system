@@ -1,0 +1,876 @@
+/* ---------- 1. CONFIG ---------- */
+const CONFIG = {
+  DB_NAME: "IncidentReportingDB",
+  DB_VERSION: 4, // v4: login passwords, action workflow (Pending→Verified), resolutions/closure. Upgrade keeps existing data.
+  // store: [[indexName, unique?], ...]  (every store: id, autoIncrement)
+  SCHEMA: {
+    roles: [["name", 1]],
+    users: [["username", 1], ["role_id"], ["department_id"]],
+    departments: [["name", 1]],
+    reporters: [["reporter_no", 1], ["department_id"], ["reporter_type"], ["status"]],
+    incident_categories: [["name", 1]],
+    incident_types: [["category_id"], ["name"]],
+    locations: [["name", 1], ["department_id"], ["status"]],
+    incidents: [["incident_no", 1], ["reporter_id"], ["category_id"], ["type_id"], ["location_id"], ["severity"], ["status"], ["incident_date"]],
+    incident_attachments: [["incident_id"]],
+    investigations: [["incident_id"], ["investigator_id"], ["status"]],
+    investigation_findings: [["investigation_id"]],
+    investigation_evidence: [["investigation_id"]],
+    actions: [["investigation_id"], ["incident_id"], ["assigned_to"], ["status"]],
+    action_monitoring: [["action_id"]],
+    resolutions: [["incident_id", 1]],
+    notifications: [["user_id"], ["incident_id"]],
+    audit_logs: [["user_id"], ["entity"]]
+  },
+  FKS: { // for the relationship test: store.field -> parent store
+    "users.role_id": "roles", "users.department_id": "departments",
+    "reporters.department_id": "departments", "incident_types.category_id": "incident_categories",
+    "locations.department_id": "departments",
+    "incidents.reporter_id": "reporters", "incidents.category_id": "incident_categories",
+    "incidents.type_id": "incident_types", "incidents.location_id": "locations",
+    "incident_attachments.incident_id": "incidents",
+    "investigations.incident_id": "incidents", "investigations.investigator_id": "users",
+    "investigation_findings.investigation_id": "investigations", "investigation_evidence.investigation_id": "investigations",
+    "investigation_evidence.uploaded_by": "users",
+    "actions.investigation_id": "investigations", "actions.incident_id": "incidents", "actions.assigned_to": "users",
+    "action_monitoring.action_id": "actions", "action_monitoring.changed_by": "users", "resolutions.incident_id": "incidents", "resolutions.resolved_by": "users",
+    "investigations.assigned_by": "users", "actions.assigned_by": "users",
+    "notifications.user_id": "users", "notifications.incident_id": "incidents", "audit_logs.user_id": "users"
+  }
+};
+
+/* ---------- Security helpers (login) ---------- */
+// Pure-JS SHA-256 so hashing also works where crypto.subtle is unavailable (e.g. opened from file://).
+function sha256(s) {
+  s = unescape(encodeURIComponent(s));
+  const rr = (v, a) => (v >>> a) | (v << (32 - a)), mw = Math.pow(2, 32);
+  let result = "", words = [], len = s.length * 8, hash = [], k = [], pc = 0, comp = {};
+  for (let c = 2; pc < 64; c++) if (!comp[c]) {
+    for (let i = 0; i < 313; i += c) comp[i] = c;
+    hash[pc] = (Math.pow(c, .5) * mw) | 0; k[pc++] = (Math.pow(c, 1 / 3) * mw) | 0;
+  }
+  s += "\x80"; while (s.length % 64 - 56) s += "\x00";
+  for (let i = 0; i < s.length; i++) words[i >> 2] |= s.charCodeAt(i) << ((3 - i) % 4) * 8;
+  words[words.length] = (len / mw) | 0; words[words.length] = len;
+  for (let j = 0; j < words.length;) {
+    const w = words.slice(j, j += 16), old = hash; hash = hash.slice(0, 8);
+    for (let i = 0; i < 64; i++) {
+      const w15 = w[i - 15], w2 = w[i - 2], a = hash[0], e = hash[4];
+      const t1 = hash[7] + (rr(e, 6) ^ rr(e, 11) ^ rr(e, 25)) + ((e & hash[5]) ^ (~e & hash[6])) + k[i] +
+        (w[i] = i < 16 ? w[i] : (w[i - 16] + (rr(w15, 7) ^ rr(w15, 18) ^ (w15 >>> 3)) + w[i - 7] + (rr(w2, 17) ^ rr(w2, 19) ^ (w2 >>> 10))) | 0);
+      const t2 = (rr(a, 2) ^ rr(a, 13) ^ rr(a, 22)) + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+      hash = [(t1 + t2) | 0].concat(hash); hash[4] = (hash[4] + t1) | 0;
+    }
+    for (let i = 0; i < 8; i++) hash[i] = (hash[i] + old[i]) | 0;
+  }
+  for (let i = 0; i < 8; i++) for (let j = 3; j + 1; j--) { const b = (hash[i] >> (j * 8)) & 255; result += (b < 16 ? "0" : "") + b.toString(16); }
+  return result;
+}
+const DEFAULT_PW = "Password1!";
+const hashPw = (username, pw) => sha256("irs|" + String(username).toLowerCase() + "|" + pw);
+
+/* ---------- 2. DATABASE ---------- */
+const SEED = {
+  roles: ["Admin", "Investigator", "Reporter Officer", "Viewer"].map(name => ({ name })),
+  departments: ["Administration", "Security", "IT", "Facilities", "Human Resources", "Academic Affairs"].map(name => ({ name, active: true })),
+  incident_categories: ["Safety", "Security", "Accident", "Property Damage", "Workplace", "IT/Technical", "Environmental", "Health", "Other"].map(name => ({ name, description: "", active: true })),
+  incident_types: [["Slip/Fall", 1], ["Equipment Failure", 1], ["Theft", 2], ["Unauthorized Access", 2], ["Fire", 7], ["Data Incident", 6], ["Vehicle Accident", 3], ["Physical Injury", 8]]
+    .map(([name, category_id]) => ({ name, category_id, active: true })),
+  locations: ["Main Building", "Parking Lot", "Library", "Laboratory", "Cafeteria"]
+    .map(b => ({ name: b, building: b, floor: "", room: "", area: "", department_id: null, description: "", status: "Active" })),
+  users: [["admin", "System Admin", 1], ["investigator1", "Investigator One", 2], ["investigator2", "Investigator Two", 2], ["officer1", "Reporter Officer One", 3], ["viewer1", "Viewer One", 4]]
+    .map(([username, full_name, role_id]) => ({ username, full_name, password_hash: hashPw(username, DEFAULT_PW), role_id, department_id: null, active: true }))
+};
+
+function upgrade(e) {
+  const db = e.target.result, tx = e.target.transaction;
+  for (const [n, idx] of Object.entries(CONFIG.SCHEMA)) {
+    const s = db.objectStoreNames.contains(n) ? tx.objectStore(n) : db.createObjectStore(n, { keyPath: "id", autoIncrement: true });
+    idx.forEach(([i, u]) => { if (!s.indexNames.contains(i)) s.createIndex(i, i, { unique: !!u }); });
+  }
+  if (e.oldVersion === 0) {
+    for (const [n, rows] of Object.entries(SEED)) rows.forEach(r => tx.objectStore(n).add(r));
+  } else { // upgrade: keep existing data
+    const us = tx.objectStore("users");
+    us.getAll().onsuccess = ev => { // add missing seed users (no duplicates) and give old accounts a default password
+      const have = new Map(ev.target.result.map(u => [u.username, u]));
+      SEED.users.forEach(r => { const u = have.get(r.username); if (!u) us.add(r); else if (!u.password_hash) us.put({ ...u, password_hash: r.password_hash }); });
+    };
+    if (e.oldVersion < 3) tx.objectStore("locations").openCursor().onsuccess = ev => {
+      const c = ev.target.result; if (!c) return;
+      if (!c.value.status) c.update({ ...c.value, building: c.value.name, floor: "", room: "", area: "", department_id: null, description: "", status: "Active" });
+      c.continue();
+    };
+    if (e.oldVersion < 4) tx.objectStore("actions").openCursor().onsuccess = ev => { // old statuses -> Pending / In Progress / Completed / Verified
+      const c = ev.target.result; if (!c) return;
+      const v = c.value, st = { Open: "Pending", Cancelled: "Pending" }[v.status] || v.status;
+      c.update({ ...v, status: st, requirements: v.requirements ?? "", remarks: v.remarks ?? (v.status === "Cancelled" ? "Previously cancelled" : ""), completion_date: v.completion_date ?? (st === "Completed" ? today() : null), assigned_by: v.assigned_by ?? null });
+      c.continue();
+    };
+  }
+}
+
+const DB = {
+  _p: null,
+  open() {
+    return this._p || (this._p = new Promise((ok, no) => {
+      const r = indexedDB.open(CONFIG.DB_NAME, CONFIG.DB_VERSION);
+      r.onupgradeneeded = upgrade;
+      r.onsuccess = () => { r.result.onversionchange = () => r.result.close(); ok(r.result); };
+      r.onerror = () => no(r.error);
+    }));
+  },
+  async run(store, mode, fn) {
+    const db = await this.open();
+    return new Promise((ok, no) => {
+      const q = fn(db.transaction(store, mode).objectStore(store));
+      q.onsuccess = () => ok(q.result);
+      q.onerror = e => { e.preventDefault(); no(q.error); };
+    });
+  },
+  all: s => DB.run(s, "readonly", o => o.getAll()),
+  get: (s, id) => DB.run(s, "readonly", o => o.get(Number(id))),
+  add: async (s, v) => { await DB.fk(s, v); return DB.run(s, "readwrite", o => o.add(v)); },   // resolves with the new id
+  put: async (s, v) => { await DB.fk(s, v); return DB.run(s, "readwrite", o => o.put(v)); },
+  async fk(s, v) { // enforce foreign keys on every insert/update (IndexedDB has no built-in FKs)
+    for (const [k, parent] of Object.entries(CONFIG.FKS)) {
+      const [st, f] = k.split(".");
+      if (st === s && v[f] != null && !(await DB.get(parent, v[f]))) { const e = new Error(`Invalid reference: ${k} = ${v[f]} does not exist in ${parent}.`); e.name = "ForeignKeyError"; throw e; }
+    }
+  },
+  byIndex: (s, i, v) => DB.run(s, "readonly", o => o.index(i).getAll(v)),
+  async testRelations() { // verify every foreign key points to an existing parent row
+    const bad = [];
+    for (const [fk, parent] of Object.entries(CONFIG.FKS)) {
+      const [store, field] = fk.split(".");
+      const ids = new Set((await DB.all(parent)).map(r => r.id));
+      (await DB.all(store)).forEach(r => { if (r[field] != null && !ids.has(r[field])) bad.push(`${fk} #${r.id}`); });
+    }
+    return bad;
+  }
+};
+
+/* ---------- 3. HELPERS ---------- */
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const opts = (list, label = "name") => list.map(x => `<option value="${x.id}">${esc(typeof label === "function" ? label(x) : x[label])}</option>`).join("");
+const byId = list => Object.fromEntries(list.map(x => [x.id, x]));
+const val = id => $("#" + id).value.trim();
+const nowISO = () => new Date().toISOString();
+const today = () => { const d = new Date(); return new Date(d - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10); };
+const fmtD = s => { // plain dates stay as-is; ISO timestamps are shown in the user's LOCAL date (not UTC)
+  if (!s) return "—"; const t = String(s);
+  if (t.length > 10) { const d = new Date(t); if (!isNaN(d)) return esc(new Date(d - d.getTimezoneOffset() * 6e4).toISOString().slice(0, 10)); }
+  return esc(t.slice(0, 10));
+};
+const bd = (t, k = t) => `<span class="badge ${String(k).replace(/\s/g, "")}">${esc(t)}</span>`;
+const ph = t => `<option value="">${t}</option>`;
+const types3 = a => a.map(t => `<option>${t}</option>`).join("");
+function msg(text, ok = true) {
+  const m = $("#msg"); if (!m) return;
+  m.textContent = text; m.className = "msg " + (ok ? "ok" : "fail");
+  clearTimeout(msg.t); msg.t = setTimeout(() => (m.textContent = ""), 5000);
+}
+
+let ME = null, ROLES = {};                       // signed-in user + role lookup
+const role = () => ROLES[ME?.role_id]?.name;
+const PERM = { reg: ["Admin", "Reporter Officer"], report: ["Admin", "Reporter Officer"], inv: ["Admin", "Investigator"], close: ["Admin"] };
+const can = p => !!ME && PERM[p].includes(role());
+const canInv = () => can("inv");
+const audit = (entity, entity_id, action, details = "") =>
+  DB.add("audit_logs", { user_id: ME.id, entity, entity_id, action, details, created_at: nowISO() });
+
+const DONE = ["Completed", "Verified"];                       // action statuses that count as finished
+const MAXF = 2 * 1024 * 1024;
+const readFile = f => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(f); });
+async function notesHTML() { // notifications for the signed-in user
+  const ns = (await DB.byIndex("notifications", "user_id", ME.id)).reverse();
+  return ns.length ? `<div class="card"><h3>Notifications (${ns.filter(n => !n.is_read).length} unread)</h3>${ns.slice(0, 5).map(n =>
+    `<p>${n.is_read ? "" : '<span class="dot"></span>'}${esc(n.message)} <small>${fmtD(n.created_at)}</small> ${n.is_read ? "" : `<button class="sec" data-a="read" data-id="${n.id}">Mark read</button>`}</p>`).join("")}</div>` : "";
+}
+
+/* Per-page handlers (reset on every navigation) */
+let A = {}, S = {}, CH = {}, I = null; // A: click actions · S: form submits · CH: change by id/data-c · I: filter input
+const app = () => $("#app");
+
+/* ---------- 4. PAGES ---------- */
+const PAGES = {}, TITLES = {
+  home: "Incident Reporting System", reporters: "Reporter Management", profile: "Reporter Profile",
+  categories: "Categories & Types", locations: "Location Management", report: "Report Incident",
+  incidents: "Incident Monitoring", locmon: "Location Monitoring", investigations: "Investigations", actions: "Action Assignment", actmon: "Action Monitoring", overdue: "Overdue Actions", resolutions: "Incident Resolution", closure: "Incident Closure", workflow: "Workflow Integration", account: "My Account", login: "Incident Reporting System"
+};
+const LINKS = [["home", "Home"], ["reporters", "Reporters"], ["categories", "Categories & Types"], ["locations", "Locations"],
+  ["report", "Report Incident"], ["incidents", "Incidents"], ["locmon", "Location Monitoring"], ["investigations", "Investigations"], ["actions", "Actions"], ["actmon", "Action Monitoring"], ["overdue", "Overdue"], ["resolutions", "Resolution"], ["closure", "Closure"], ["workflow", "Workflow"]];
+
+/* Home dashboard + connection test */
+PAGES.home = async () => {
+  const [inc, inv, act] = await Promise.all(["incidents", "investigations", "actions"].map(s => DB.all(s)));
+  const bad = await DB.testRelations(), n = st => inc.filter(i => i.status === st).length, late = act.filter(a => a.due_date < today() && !DONE.includes(a.status)).length;
+  const tile = (cls, href, num, label) => `<a class="stat ${cls}" href="#${href}"><b>${num}</b><span>${label}</span></a>`;
+  app().innerHTML = `<p class="lead">Signed in as ${esc(ME.full_name)}.</p>${await notesHTML()}
+    <div class="stats">${tile("s-open", "incidents", n("Open"), "Open incidents")}${tile("s-inv", "investigations", n("Under Investigation"), "Under investigation")}
+    ${tile("s-res", "closure", n("Resolved"), "Resolved, awaiting closure")}${tile(late ? "s-late" : "s-ok", "overdue", late, "Overdue actions")}${tile("", "incidents", inc.length, "Total incidents")}</div>
+    <div class="card health"><h3>System status</h3><p>Database: <strong class="ok">Connected</strong></p>
+    <p>Investigations: <strong>${inv.length}</strong> &nbsp; Actions: <strong>${act.length}</strong></p>
+    <p>Record links: <strong class="${bad.length ? "fail" : "ok"}">${bad.length ? "Broken: " + esc(bad.join(", ")) : "All references valid"}</strong></p></div>`;
+};
+
+/* Labs 4-5 — Reporter registration + management */
+PAGES.reporters = async () => {
+  const depts = await DB.all("departments"), dn = byId(depts); let editing = null;
+  const F = ["reporter_no", "full_name", "department_id", "position", "contact", "email", "address", "reporter_type", "status"];
+  const T = types3(["Employee", "Student", "Visitor", "Contractor"]);
+  app().innerHTML = `<form id="rform"><h3 id="ftitle">Register Reporter</h3><div class="grid">
+    <label>Employee/Student ID *<input id="reporter_no"></label><label>Full Name *<input id="full_name"></label>
+    <label>Department *<select id="department_id">${ph("-- Select --")}${opts(depts)}</select></label>
+    <label>Position<input id="position"></label><label>Contact Number<input id="contact"></label>
+    <label>Email<input id="email" type="email"></label><label>Address<input id="address"></label>
+    <label>Reporter Type *<select id="reporter_type">${T}</select></label>
+    <label>Status<select id="status"><option>Active</option><option>Inactive</option></select></label></div>
+    <button>Save Reporter</button> <button type="button" class="sec" data-a="clear">Clear</button></form>
+    <div class="card grid flt"><label>Search name<input id="qname"></label><label>Search ID<input id="qid"></label>
+    <label>Department<select id="fdept">${ph("All departments")}${opts(depts)}</select></label>
+    <label>Type<select id="ftype">${ph("All types")}${T}</select></label></div>
+    <div class="table-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Department</th><th>Type</th><th>Contact</th><th>Status</th><th></th></tr></thead><tbody id="rows"></tbody></table></div>`;
+  const render = async () => {
+    const n = val("qname").toLowerCase(), i = val("qid").toLowerCase(), d = $("#fdept").value, t = $("#ftype").value;
+    const rows = (await DB.all("reporters")).filter(r => r.full_name.toLowerCase().includes(n) && r.reporter_no.toLowerCase().includes(i) && (!d || r.department_id == d) && (!t || r.reporter_type === t));
+    $("#rows").innerHTML = rows.map(r => `<tr><td>${esc(r.reporter_no)}</td><td><a href="#profile?id=${r.id}">${esc(r.full_name)}</a></td>
+      <td>${esc(dn[r.department_id]?.name)}</td><td>${esc(r.reporter_type)}</td><td>${esc(r.contact)}</td><td>${bd(r.status)}</td>
+      <td><button class="sec" data-a="edit" data-id="${r.id}">Edit</button> <button class="sec" data-a="tog" data-id="${r.id}">${r.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>`).join("")
+      || '<tr><td colspan="7">No reporters found.</td></tr>';
+  };
+  const clear = () => { editing = null; $("#rform").reset(); $("#ftitle").textContent = "Register Reporter"; };
+  I = render; A.clear = clear;
+  A.edit = async id => { const r = await DB.get("reporters", id); editing = r.id; F.forEach(k => ($("#" + k).value = r[k] ?? "")); $("#ftitle").textContent = "Edit Reporter"; scrollTo(0, 0); };
+  A.tog = async id => { const r = await DB.get("reporters", id); r.status = r.status === "Active" ? "Inactive" : "Active"; await DB.put("reporters", r); render(); msg(`${r.full_name} is now ${r.status}.`); };
+  S.rform = async () => {
+    const r = {}; F.forEach(k => (r[k] = val(k))); r.department_id = Number(r.department_id);
+    const err = [];
+    if (!r.reporter_no) err.push("ID is required");
+    if (!r.full_name) err.push("Full name is required");
+    if (!r.department_id) err.push("Department is required");
+    if (r.email && !/^\S+@\S+\.\S+$/.test(r.email)) err.push("Email is invalid");
+    if (r.contact && !/^[0-9+\-\s()]{7,15}$/.test(r.contact)) err.push("Contact number is invalid");
+    if (err.length) return msg(err.join(". ") + ".", false);
+    try {
+      if (editing) { await DB.put("reporters", { ...(await DB.get("reporters", editing)), ...r }); msg("Reporter updated."); }
+      else { await DB.add("reporters", { ...r, created_at: nowISO() }); msg("Reporter registered successfully."); }
+      clear(); render();
+    } catch (x) { msg(x.name === "ConstraintError" ? "That Employee/Student ID already exists." : x.message, false); }
+  };
+  render();
+};
+
+/* Lab 6 — Reporter profile (#profile?id=N) */
+PAGES.profile = async q => {
+  const id = Number(q.get("id")), r = id > 0 ? await DB.get("reporters", id) : null;
+  if (!r) { app().innerHTML = '<p class="card">Reporter not found.</p>'; return; }
+  const dept = await DB.get("departments", r.department_id), cats = byId(await DB.all("incident_categories"));
+  const incs = (await DB.byIndex("incidents", "reporter_id", id)).sort((a, b) => b.incident_date.localeCompare(a.incident_date));
+  let rows = "";
+  for (const i of incs) {
+    const inv = (await DB.byIndex("investigations", "incident_id", i.id))[0], res = (await DB.byIndex("resolutions", "incident_id", i.id))[0];
+    rows += `<tr><td>${esc(i.incident_no)}</td><td>${esc(i.incident_date)}</td><td>${esc(cats[i.category_id]?.name)}</td><td>${bd(i.status)}</td><td>${esc(inv?.status || "Not started")}</td><td>${res ? "Resolved" : "Unresolved"}</td></tr>`;
+  }
+  app().innerHTML = `<div class="card"><h2>${esc(r.full_name)} ${bd(r.status)}</h2>
+    <p>ID: ${esc(r.reporter_no)} · ${esc(r.reporter_type)} · ${esc(dept?.name)} · ${esc(r.position)}<br>${esc(r.contact)} · ${esc(r.email)} · ${esc(r.address)}</p>
+    <p><strong>Incidents reported: ${incs.length}</strong></p></div><h3>Reported Incidents</h3>
+    <div class="table-wrap"><table><thead><tr><th>Incident No.</th><th>Date</th><th>Category</th><th>Status</th><th>Investigation</th><th>Resolution</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6">No incidents reported.</td></tr>'}</tbody></table></div>`;
+};
+
+/* Lab 7 — Categories & types */
+PAGES.categories = async () => {
+  let cats = [], types = [];
+  const stat = a => bd(a ? "Active" : "Inactive");
+  app().innerHTML = `<form id="cform"><h3>Incident Category</h3><input type="hidden" id="c_id">
+    <div class="grid"><label>Name *<input id="c_name"></label><label>Description<input id="c_desc"></label></div><button>Save Category</button></form>
+    <div class="table-wrap"><table><thead><tr><th>Category</th><th>Description</th><th>Status</th><th></th></tr></thead><tbody id="crows"></tbody></table></div>
+    <form id="tform"><h3>Incident Type</h3><input type="hidden" id="t_id">
+    <div class="grid"><label>Name *<input id="t_name"></label><label>Category *<select id="t_cat"></select></label></div><button>Save Type</button></form>
+    <div class="table-wrap"><table><thead><tr><th>Type</th><th>Category</th><th>Status</th><th></th></tr></thead><tbody id="trows"></tbody></table></div>`;
+  const btns = (k, x, s) => `<button class="sec" data-a="${k}" data-id="${x.id}">Edit</button> <button class="sec" data-a="toggle" data-s="${s}" data-id="${x.id}">${x.active ? "Deactivate" : "Activate"}</button>`;
+  const load = async () => {
+    cats = await DB.all("incident_categories"); types = await DB.all("incident_types"); const cn = byId(cats);
+    $("#t_cat").innerHTML = opts(cats, c => c.name + (c.active ? "" : " (inactive)"));
+    $("#crows").innerHTML = cats.map(c => `<tr><td>${esc(c.name)}</td><td>${esc(c.description)}</td><td>${stat(c.active)}</td><td>${btns("editC", c, "incident_categories")}</td></tr>`).join("");
+    $("#trows").innerHTML = types.map(t => `<tr><td>${esc(t.name)}</td><td>${esc(cn[t.category_id]?.name)}</td><td>${stat(t.active)}</td><td>${btns("editT", t, "incident_types")}</td></tr>`).join("");
+  };
+  A.editC = id => { const c = cats.find(x => x.id == id); $("#c_id").value = id; $("#c_name").value = c.name; $("#c_desc").value = c.description; scrollTo(0, 0); };
+  A.editT = id => { const t = types.find(x => x.id == id); $("#t_id").value = id; $("#t_name").value = t.name; $("#t_cat").value = t.category_id; $("#tform").scrollIntoView(); };
+  A.toggle = async (id, b) => { const s = b.dataset.s, r = await DB.get(s, id); r.active = !r.active; await DB.put(s, r); load(); msg(`${r.name} is now ${r.active ? "active" : "inactive"}.`); };
+  const save = async (store, id, data, form) => {
+    try {
+      if (id) await DB.put(store, { ...(await DB.get(store, id)), ...data }); else await DB.add(store, { ...data, active: true });
+      msg("Saved successfully."); form.reset(); form.querySelector("[type=hidden]").value = ""; load();
+    } catch (x) { msg(x.name === "ConstraintError" ? "That name already exists." : x.message, false); }
+  };
+  S.cform = f => { const name = val("c_name"); if (!name) return msg("Category name is required.", false); save("incident_categories", $("#c_id").value, { name, description: val("c_desc") }, f); };
+  S.tform = f => {
+    const name = val("t_name"), category_id = Number($("#t_cat").value);
+    if (!name || !category_id) return msg("Type name and category are required.", false);
+    if (types.some(t => t.category_id === category_id && t.name.toLowerCase() === name.toLowerCase() && t.id != $("#t_id").value)) return msg("That type already exists in this category.", false);
+    save("incident_types", $("#t_id").value, { name, category_id }, f);
+  };
+  load();
+};
+
+/* Lab 11 — Location management */
+PAGES.locations = async () => {
+  const depts = await DB.all("departments"), dn = byId(depts); let editing = null;
+  const F = ["building", "floor", "room", "area", "department_id", "description", "status"];
+  app().innerHTML = `<form id="lform"><h3 id="ltitle">Register Location</h3><div class="grid">
+    <label>Building *<input id="building"></label><label>Floor<input id="floor"></label>
+    <label>Room/Office<input id="room"></label><label>Area<input id="area"></label>
+    <label>Department<select id="department_id">${ph("-- None --")}${opts(depts)}</select></label>
+    <label>Status<select id="status"><option>Active</option><option>Inactive</option></select></label></div>
+    <label>Location Description<textarea id="description" rows="2"></textarea></label>
+    <button>Save Location</button> <button type="button" class="sec" data-a="clear">Clear</button></form>
+    <div class="card grid flt"><label>Search<input id="q"></label>
+    <label>Department<select id="fdept">${ph("All")}${opts(depts)}</select></label>
+    <label>Status<select id="fst">${ph("All")}<option>Active</option><option>Inactive</option></select></label></div>
+    <div class="table-wrap"><table><thead><tr><th>Location</th><th>Department</th><th>Description</th><th>Status</th><th></th></tr></thead><tbody id="rows"></tbody></table></div>`;
+  const render = async () => {
+    const q = val("q").toLowerCase(), d = $("#fdept").value, s = $("#fst").value;
+    const rows = (await DB.all("locations")).filter(l => (l.name + " " + l.description).toLowerCase().includes(q) && (!d || l.department_id == d) && (!s || l.status === s));
+    $("#rows").innerHTML = rows.map(l => `<tr><td>${esc(l.name)}</td><td>${esc(dn[l.department_id]?.name) || "—"}</td><td>${esc(l.description)}</td><td>${bd(l.status)}</td>
+      <td><button class="sec" data-a="edit" data-id="${l.id}">Edit</button> <button class="sec" data-a="tog" data-id="${l.id}">${l.status === "Active" ? "Deactivate" : "Activate"}</button></td></tr>`).join("")
+      || '<tr><td colspan="5">No locations found.</td></tr>';
+  };
+  const clear = () => { editing = null; $("#lform").reset(); $("#ltitle").textContent = "Register Location"; };
+  I = render; A.clear = clear;
+  A.edit = async id => { const l = await DB.get("locations", id); editing = l.id; F.forEach(k => ($("#" + k).value = l[k] ?? "")); $("#ltitle").textContent = "Edit Location"; scrollTo(0, 0); };
+  A.tog = async id => { const l = await DB.get("locations", id); l.status = l.status === "Active" ? "Inactive" : "Active"; await DB.put("locations", l); render(); msg(`${l.name} is now ${l.status}.`); };
+  S.lform = async () => {
+    const r = {}; F.forEach(k => (r[k] = val(k)));
+    if (!r.building) return msg("Building is required.", false);
+    r.department_id = r.department_id ? +r.department_id : null;
+    r.name = [r.building, r.floor && `Floor ${r.floor}`, r.room, r.area].filter(Boolean).join(" – ");
+    try {
+      if (editing) { await DB.put("locations", { ...(await DB.get("locations", editing)), ...r }); msg("Location updated."); }
+      else { await DB.add("locations", r); msg("Location registered successfully."); }
+      clear(); render();
+    } catch (x) { msg(x.name === "ConstraintError" ? "That location already exists." : x.message, false); }
+  };
+  render();
+};
+
+/* Labs 8, 9, 12 — Report incident (with validation + location) */
+PAGES.report = async () => {
+  const [reps, cats, locs, all] = await Promise.all(["reporters", "incident_categories", "locations", "incident_types"].map(s => DB.all(s)));
+  const types = all.filter(t => t.active);
+  app().innerHTML = `<form id="iform"><div class="grid">
+    <label>Reporter *<select id="reporter_id">${ph("-- Select reporter --")}${opts(reps.filter(r => r.status === "Active"), r => `${r.full_name} (${r.reporter_no})`)}</select></label>
+    <label>Category *<select id="category_id">${ph("-- Select category --")}${opts(cats.filter(c => c.active))}</select></label>
+    <label>Incident Type *<select id="type_id">${ph("-- Select category first --")}</select></label>
+    <label>Location *<select id="location_id">${ph("-- Select location --")}${opts(locs.filter(l => l.status === "Active"))}</select></label>
+    <label>Date of Incident *<input type="date" id="incident_date" max="${today()}"></label>
+    <label>Time of Incident *<input type="time" id="incident_time"></label>
+    <label>Severity *<select id="severity">${ph("-- Select --")}${types3(["Low", "Medium", "High", "Critical"])}</select></label></div>
+    <label>Description *<textarea id="description" rows="4"></textarea></label>
+    <label>Immediate Response<textarea id="immediate_response" rows="2"></textarea></label><button>Save Incident</button></form>`;
+  CH.category_id = () => ($("#type_id").innerHTML = ph("-- Select type --") + opts(types.filter(t => t.category_id == $("#category_id").value)));
+  S.iform = async f => {
+    const err = [];
+    if (!val("reporter_id")) err.push("Reporter is required");
+    if (!val("category_id")) err.push("Incident category is required");
+    if (!val("type_id")) err.push("Incident type is required");
+    if (!val("location_id")) err.push("Location is required");
+    if (!val("incident_date") || !val("incident_time")) err.push("Date and time of incident are required");
+    else { const dt = new Date(`${val("incident_date")}T${val("incident_time")}`); if (isNaN(dt)) err.push("Incident date/time is invalid"); else if (dt > new Date()) err.push("Incident date/time cannot be in the future"); }
+    if (!val("description")) err.push("Description cannot be empty");
+    if (!val("severity")) err.push("Severity must be selected");
+    if (err.length) return msg(err.join(". ") + ".", false);
+    const d = today().replaceAll("-", "");
+    let n = (await DB.all("incidents")).filter(i => i.incident_no.startsWith("INC-" + d)).length + 1; // INC-YYYYMMDD-0001
+    const rec = { reporter_id: +val("reporter_id"), category_id: +val("category_id"), type_id: +val("type_id"), location_id: +val("location_id"),
+      incident_date: val("incident_date"), incident_time: val("incident_time"), description: val("description"), severity: val("severity"),
+      immediate_response: val("immediate_response"), status: "Open", date_reported: nowISO() };
+    for (let tries = 0; tries < 5; tries++) { // retry if the unique index rejects the number
+      try {
+        rec.incident_no = `INC-${d}-${String(n++).padStart(4, "0")}`;
+        const id = await DB.add("incidents", rec); await audit("incidents", id, "create", rec.incident_no);
+        msg(`Incident saved as ${rec.incident_no}.`); f.reset(); $("#type_id").innerHTML = ph("-- Select category first --"); return;
+      } catch (x) { if (x.name !== "ConstraintError") return msg(x.message, false); }
+    }
+    msg("Could not generate a unique incident number. Try again.", false);
+  };
+};
+
+/* Labs 10, 12 — Incident search, location filter, details */
+PAGES.incidents = async () => {
+  const [cats, types, reps, locs] = await Promise.all(["incident_categories", "incident_types", "reporters", "locations"].map(s => DB.all(s)));
+  const cn = byId(cats), tn = byId(types), rn = byId(reps), ln = byId(locs);
+  app().innerHTML = `<div class="card grid flt">
+    <label>Incident No.<input id="q_no"></label><label>Reporter<input id="q_rep"></label>
+    <label>Category<select id="f_cat">${ph("All")}${opts(cats)}</select></label><label>Type<select id="f_type"></select></label>
+    <label>Location<select id="f_loc">${ph("All")}${opts(locs)}</select></label><label>Date<input type="date" id="f_date"></label>
+    <label>Severity<select id="f_sev">${ph("All")}${types3(["Low", "Medium", "High", "Critical"])}</select></label>
+    <label>Status<select id="f_stat">${ph("All")}${types3(["Open", "Under Investigation", "Resolved", "Closed"])}</select></label></div>
+    <p id="count"></p><div class="table-wrap"><table><thead><tr><th>Incident No.</th><th>Reporter</th><th>Category</th><th>Type</th><th>Location</th><th>Date</th><th>Severity</th><th>Status</th><th></th></tr></thead><tbody id="rows"></tbody></table></div><div id="detail"></div>`;
+  const fillTypes = () => { const c = $("#f_cat").value; $("#f_type").innerHTML = ph("All") + opts(types.filter(t => !c || t.category_id == c)); };
+  const render = async () => {
+    const q = { no: val("q_no").toLowerCase(), rep: val("q_rep").toLowerCase(), cat: $("#f_cat").value, type: $("#f_type").value, loc: $("#f_loc").value, date: $("#f_date").value, sev: $("#f_sev").value, st: $("#f_stat").value };
+    const rows = (await DB.all("incidents")).filter(i => i.incident_no.toLowerCase().includes(q.no) && (rn[i.reporter_id]?.full_name || "").toLowerCase().includes(q.rep) &&
+      (!q.cat || i.category_id == q.cat) && (!q.type || i.type_id == q.type) && (!q.loc || i.location_id == q.loc) && (!q.date || i.incident_date === q.date) &&
+      (!q.sev || i.severity === q.sev) && (!q.st || i.status === q.st)).reverse();
+    $("#count").textContent = `${rows.length} incident(s) found`;
+    $("#rows").innerHTML = rows.map(i => `<tr><td>${esc(i.incident_no)}</td><td><a href="#profile?id=${i.reporter_id}">${esc(rn[i.reporter_id]?.full_name)}</a></td>
+      <td>${esc(cn[i.category_id]?.name)}</td><td>${esc(tn[i.type_id]?.name)}</td><td>${esc(ln[i.location_id]?.name) || "—"}</td>
+      <td>${esc(i.incident_date)} ${esc(i.incident_time)}</td><td>${bd(i.severity)}</td><td>${bd(i.status)}</td>
+      <td><button class="sec" data-a="view" data-id="${i.id}">View</button></td></tr>`).join("") || '<tr><td colspan="9">No incidents match.</td></tr>';
+  };
+  I = e => { if (e.target.id === "f_cat") fillTypes(); render(); };
+  A.view = async id => {
+    const i = await DB.get("incidents", id), inv = (await DB.byIndex("investigations", "incident_id", i.id))[0], res = (await DB.byIndex("resolutions", "incident_id", i.id))[0];
+    $("#detail").innerHTML = `<div class="card"><h3>${esc(i.incident_no)} ${bd(i.severity)} ${bd(i.status)}</h3>
+      <p><b>Reporter:</b> ${esc(rn[i.reporter_id]?.full_name)} · <b>Category:</b> ${esc(cn[i.category_id]?.name)} · <b>Type:</b> ${esc(tn[i.type_id]?.name)}</p>
+      <p><b>Location:</b> ${esc(ln[i.location_id]?.name) || "Not specified"} · <b>When:</b> ${esc(i.incident_date)} ${esc(i.incident_time)} · <b>Reported:</b> ${fmtD(i.date_reported)}</p>
+      <p><b>Description:</b> ${esc(i.description)}</p><p><b>Immediate response:</b> ${esc(i.immediate_response) || "—"}</p>
+      <p><b>Investigation:</b> ${inv ? `${esc(inv.status)} (<a href="#investigations?id=${inv.id}">open</a>)` : "Not started"}</p>
+      <p><b>Resolution:</b> ${res ? `${esc(res.type)} (${fmtD(res.resolution_date)})${res.closure_date ? " · Closed " + fmtD(res.closure_date) : ""}` : "Not resolved"} · <a href="#workflow?inc=${i.id}">Trace this incident</a></p></div>`;
+    $("#detail").scrollIntoView();
+  };
+  fillTypes(); render();
+};
+
+/* Lab 13 — Location-based monitoring */
+PAGES.locmon = async () => {
+  const [locs, incs, types] = await Promise.all(["locations", "incidents", "incident_types"].map(s => DB.all(s))), tn = byId(types);
+  const groups = [...locs.map(l => [l.name, incs.filter(i => i.location_id === l.id)]), ["Not specified", incs.filter(i => !i.location_id)]]
+    .filter(([n, a]) => n !== "Not specified" || a.length).sort((a, b) => b[1].length - a[1].length);
+  const sev = ["Critical", "High", "Medium", "Low"];
+  const rows = groups.map(([name, a]) => {
+    const tc = {}; a.forEach(i => (tc[tn[i.type_id]?.name || "?"] = (tc[tn[i.type_id]?.name || "?"] || 0) + 1));
+    const tl = Object.entries(tc), rec = tl.filter(([, c]) => c >= 2);
+    return `<tr><td>${esc(name)}</td><td><b>${a.length}</b></td><td>${tl.map(([t, c]) => `${esc(t)} ×${c}`).join(", ") || "—"}</td>
+      <td>${sev.map(s => { const c = a.filter(i => i.severity === s).length; return c ? bd(`${s} ${c}`, s) : ""; }).join(" ") || "—"}</td>
+      <td>${a.filter(i => ["Open", "Under Investigation"].includes(i.status)).length}</td><td>${a.filter(i => ["Resolved", "Closed"].includes(i.status)).length}</td>
+      <td>${rec.map(([t, c]) => bd(`${t} ×${c}`, "Overdue")).join(" ") || "—"}</td></tr>`;
+  }).join("");
+  app().innerHTML = `<p>${incs.length} incident(s) across ${groups.filter(g => g[1].length).length} location(s). Recurring = the same incident type reported 2+ times at one location.</p>
+    <div class="table-wrap"><table><thead><tr><th>Location</th><th>Incidents</th><th>Types</th><th>Severity</th><th>Open</th><th>Resolved</th><th>Recurring</th></tr></thead><tbody>${rows || '<tr><td colspan="7">No incidents yet.</td></tr>'}</tbody></table></div>`;
+};
+
+/* Labs 14-19 — Investigations: assignment, status tracking, findings, evidence, root-cause analysis */
+const ST = ["Assigned", "In Progress", "Evidence Gathering", "Findings Prepared", "Completed"];
+PAGES.investigations = async q => {
+  let sel = Number(q.get("id")) || null;
+  const users = await DB.all("users"), un = byId(users);
+  const investigators = users.filter(u => u.active && ["Investigator", "Admin"].includes(ROLES[u.role_id]?.name));
+  const ok = canInv();
+  app().innerHTML = `<div id="notes"></div>
+    ${ok ? `<form id="nform"><h3>Assign Investigation</h3><div class="grid">
+      <label>Incident *<select id="n_inc"></select></label>
+      <label>Investigator *<select id="n_inv">${ph("-- Select investigator --")}${opts(investigators, "full_name")}</select></label>
+      <label>Start Date *<input type="date" id="n_start" value="${today()}"></label><label>Target Completion Date *<input type="date" id="n_target"></label></div>
+      <label>Investigation Instructions<textarea id="n_instr" rows="2"></textarea></label><label>Investigation Notes<textarea id="n_notes" rows="2"></textarea></label>
+      <button>Assign &amp; Notify</button></form>` : '<p class="card">Only investigators and admins can assign or update investigations.</p>'}
+    <h3>Investigations</h3><div class="table-wrap"><table><thead><tr><th>Incident</th><th>Investigator</th><th>Start</th><th>Deadline</th><th>Status</th><th>Completed</th><th></th></tr></thead><tbody id="irows"></tbody></table></div><div id="detail"></div>`;
+
+  const notes = async () => { $("#notes").innerHTML = await notesHTML(); drawNav(); };
+  const list = async () => {
+    const [incs, invs] = await Promise.all([DB.all("incidents"), DB.all("investigations")]), inc = byId(incs);
+    if (ok) $("#n_inc").innerHTML = ph("-- Select open incident --") + opts(incs.filter(i => i.status === "Open" && !invs.some(v => v.incident_id === i.id)), i => `${i.incident_no} (${i.severity}) – ${i.description.slice(0, 40)}`);
+    $("#irows").innerHTML = invs.slice().reverse().map(v => `<tr><td>${esc(inc[v.incident_id]?.incident_no)}</td><td>${esc(un[v.investigator_id]?.full_name)}</td>
+      <td>${fmtD(v.start_date)}</td><td>${fmtD(v.target_date)} ${v.status !== "Completed" && v.target_date < today() ? bd("Overdue") : ""}</td><td>${bd(v.status)}</td><td>${fmtD(v.end_date)}</td>
+      <td><button class="sec" data-a="open" data-id="${v.id}">Open</button></td></tr>`).join("") || '<tr><td colspan="7">No investigations yet.</td></tr>';
+  };
+  const detail = async () => {
+    const el = $("#detail"), v = sel ? await DB.get("investigations", sel) : null;
+    if (!v) { el.innerHTML = ""; return; }
+    const inc = await DB.get("incidents", v.incident_id), idx = ST.indexOf(v.status), r = v.rca || {};
+    const finds = await DB.byIndex("investigation_findings", "investigation_id", v.id), evs = await DB.byIndex("investigation_evidence", "investigation_id", v.id);
+    const ta = (id, label, text = "", rows = 2) => `<label>${label}<textarea id="${id}" rows="${rows}">${esc(text)}</textarea></label>`;
+    el.innerHTML = `<div class="card"><h3>${esc(inc.incident_no)} — ${esc(un[v.investigator_id]?.full_name)}</h3>
+      <div class="steps">${ST.map((s, i) => `<span class="step ${i < idx ? "done" : i === idx ? "on" : ""}">${s}</span>`).join("")}</div>
+      <p><b>Start:</b> ${fmtD(v.start_date)} · <b>Deadline:</b> ${fmtD(v.target_date)} · <b>Completed:</b> ${fmtD(v.end_date)} · <b>Assigned:</b> ${fmtD(v.assigned_at)}</p>
+      <p><b>Instructions:</b> ${esc(v.instructions) || "—"}</p><p><b>Notes:</b> ${esc(v.notes) || "—"}</p>
+      ${ok && idx < ST.length - 1 ? `<button data-a="adv" data-id="${v.id}">Move to “${ST[idx + 1]}”</button>` : ""}</div>
+
+      <div class="card"><h3>Findings</h3><div class="table-wrap"><table><thead><tr><th>Findings</th><th>Root cause</th><th>Contributing factors</th><th>Witnesses</th><th>Evidence</th><th>Recommendation</th></tr></thead><tbody>
+      ${finds.map(f => `<tr><td>${esc(f.finding)}</td><td>${esc(f.root_cause)}</td><td>${esc(f.contributing_factors)}</td><td>${esc(f.witnesses)}</td><td>${esc(f.evidence_summary)}</td><td>${esc(f.recommendation)}</td></tr>`).join("") || '<tr><td colspan="6">No findings recorded.</td></tr>'}</tbody></table></div>
+      ${ok ? `<form id="fform">${ta("f_finding", "Findings *")}<div class="grid">${ta("f_root", "Root cause")}${ta("f_contrib", "Contributing factors")}${ta("f_wit", "Witnesses")}${ta("f_evid", "Evidence summary")}</div>${ta("f_rec", "Investigator recommendation")}<button>Add Finding</button></form>` : ""}</div>
+
+      <div class="card"><h3>Evidence</h3>${ok ? `<div class="table-wrap"><table><thead><tr><th>File</th><th>Description</th><th>Uploaded by</th><th>Uploaded</th></tr></thead><tbody>
+      ${evs.map(e => `<tr><td>${e.file_type?.startsWith("image/") ? `<img class="thumb" src="${e.file_data}" alt=""> ` : ""}<a href="${e.file_data}" download="${esc(e.file_name)}">${esc(e.file_name)}</a></td><td>${esc(e.description)}</td><td>${esc(un[e.uploaded_by]?.full_name)}</td><td>${fmtD(e.collected_at)}</td></tr>`).join("") || '<tr><td colspan="4">No evidence uploaded.</td></tr>'}</tbody></table></div>
+      <form id="eform"><div class="grid"><label>File (document or photo, max 2 MB) *<input type="file" id="e_file" accept="image/*,.pdf,.doc,.docx,.txt"></label><label>Description<input id="e_desc"></label></div><button>Upload Evidence</button></form>`
+      : "<p>Restricted: only investigators and admins can view or upload evidence.</p>"}</div>
+
+      <div class="card"><h3>Root Cause Analysis</h3>${ok ? `<form id="rcaform"><p>Problem → Cause → Evidence → Root Cause → Recommendation</p>
+      ${ta("r_problem", "Problem *", r.problem ?? inc.description)}<div class="grid">${ta("r_immediate", "Immediate cause", r.immediate)}${ta("r_cause", "Cause", r.cause)}${ta("r_evidence", "Supporting evidence", r.evidence)}
+      ${ta("r_root", "Root cause *", r.root)}${ta("r_contrib", "Contributing factors", r.contrib)}${ta("r_prevent", "Recommended preventive measures", r.prevent)}</div><button>Save Analysis</button></form>` : "<p>Restricted.</p>"}</div>`;
+  };
+
+  A.open = id => { sel = Number(id); detail(); $("#detail").scrollIntoView(); };
+  A.adv = async id => {
+    const v = await DB.get("investigations", id), next = ST[ST.indexOf(v.status) + 1];
+    if (!next) return;
+    if (next === "Completed" && !(await DB.byIndex("investigation_findings", "investigation_id", v.id)).length) return msg("Record at least one finding before completing.", false);
+    v.status = next; if (next === "Completed") v.end_date = today();
+    await DB.put("investigations", v); await audit("investigations", v.id, "status", next);
+    msg(`Investigation moved to ${next}.`); list(); detail();
+  };
+  S.nform = async f => {
+    const inc = val("n_inc"), inv = val("n_inv"), sd = val("n_start"), td = val("n_target"), err = [];
+    if (!inc) err.push("Incident is required");
+    if (!inv) err.push("Investigator is required");
+    if (!sd || !td) err.push("Start and target dates are required"); else if (td < sd) err.push("Target date cannot be before the start date");
+    if (inc && (await DB.byIndex("investigations", "incident_id", +inc)).length) err.push("That incident already has an investigation");
+    const inc0 = inc ? await DB.get("incidents", inc) : null;
+    if (inc0 && inc0.status !== "Open") err.push("Only reported (Open) incidents can be investigated");
+    if (inc0 && sd && sd < inc0.incident_date) err.push("Investigation cannot start before the incident date");
+    if (err.length) return msg(err.join(". ") + ".", false);
+    const i = await DB.get("incidents", inc);
+    const id = await DB.add("investigations", { incident_id: i.id, investigator_id: +inv, status: "Assigned", start_date: sd, target_date: td, end_date: null,
+      instructions: val("n_instr"), notes: val("n_notes"), assigned_at: nowISO(), assigned_by: ME.id });
+    i.status = "Under Investigation"; await DB.put("incidents", i);
+    await DB.add("notifications", { user_id: +inv, incident_id: i.id, message: `You were assigned to investigate ${i.incident_no} (due ${td}).`, is_read: false, created_at: nowISO() });
+    await audit("investigations", id, "create", i.incident_no);
+    msg(`Investigation assigned for ${i.incident_no}; investigator notified.`); f.reset(); $("#n_start").value = today(); sel = id; list(); notes(); detail();
+  };
+  S.fform = async () => {
+    if (!val("f_finding")) return msg("Findings text is required.", false);
+    await DB.add("investigation_findings", { investigation_id: sel, finding: val("f_finding"), root_cause: val("f_root"), contributing_factors: val("f_contrib"),
+      witnesses: val("f_wit"), evidence_summary: val("f_evid"), recommendation: val("f_rec"), created_at: nowISO() });
+    await audit("investigations", sel, "finding"); msg("Finding recorded."); detail();
+  };
+  S.eform = async () => {
+    const f = $("#e_file").files[0];
+    if (!canInv()) return msg("You are not authorized to upload evidence.", false);
+    if (!f) return msg("Choose a file to upload.", false);
+    if (f.size > 2 * 1024 * 1024) return msg("File is too large (max 2 MB).", false);
+    const data = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(f); });
+    await DB.add("investigation_evidence", { investigation_id: sel, description: val("e_desc"), file_name: f.name, file_type: f.type, file_data: data, uploaded_by: ME.id, collected_at: nowISO() });
+    await audit("investigations", sel, "evidence", f.name); msg("Evidence uploaded."); detail();
+  };
+  S.rcaform = async () => {
+    if (!val("r_problem") || !val("r_root")) return msg("Problem and root cause are required.", false);
+    const v = await DB.get("investigations", sel);
+    v.rca = { problem: val("r_problem"), immediate: val("r_immediate"), cause: val("r_cause"), evidence: val("r_evidence"), root: val("r_root"), contrib: val("r_contrib"), prevent: val("r_prevent") };
+    await DB.put("investigations", v); await audit("investigations", sel, "rca"); msg("Root cause analysis saved.");
+  };
+  notes(); list(); detail();
+};
+
+/* Labs 20-21 — Action assignment */
+const ATYPES = ["Corrective Action", "Preventive Action", "Safety Improvement", "Equipment Repair", "Policy Improvement", "Training", "Process Improvement"];
+const ASTAT = ["Pending", "In Progress", "Completed", "Verified"], PRI = ["Low", "Medium", "High", "Critical"];
+const NEXT = { Pending: "In Progress", "In Progress": "Completed", Completed: "Verified" };
+const RTYPES = ["Corrected", "Mitigated", "Preventive Measures Implemented", "No Fault Found", "Referred to Another Unit", "Other"];
+PAGES.actions = async () => {
+  const [users, incs, invs, finds] = await Promise.all(["users", "incidents", "investigations", "investigation_findings"].map(s => DB.all(s)));
+  const un = byId(users), inc = byId(incs), vn = byId(invs);
+  const ready = invs.filter(v => finds.some(f => f.investigation_id === v.id)); // actions are based on recorded findings
+  app().innerHTML = `<form id="aform"><h3>Assign Action</h3><div class="grid">
+    <label>Investigation *<select id="a_inv">${ph(ready.length ? "-- Select investigation --" : "-- Record findings first --")}${opts(ready, v => `${inc[v.incident_id]?.incident_no} (${v.status})`)}</select></label>
+    <label>Action Type *<select id="a_type">${ph("-- Select --")}${types3(ATYPES)}</select></label>
+    <label>Responsible Person *<select id="a_who">${ph("-- Select --")}${opts(users.filter(u => u.active), u => `${u.full_name} (${ROLES[u.role_id]?.name})`)}</select></label>
+    <label>Target Date *<input type="date" id="a_due" min="${today()}"></label>
+    <label>Priority *<select id="a_pri">${ph("-- Select --")}${types3(PRI)}</select></label></div>
+    <div id="basis"></div>
+    <label>Action Description *<textarea id="a_desc" rows="2"></textarea></label>
+    <label>Action Requirements *<textarea id="a_req" rows="2" placeholder="What must be done, resources needed, how completion is judged"></textarea></label>
+    <button>Assign &amp; Notify</button></form>
+    <div class="card grid flt"><label>Status<select id="f_st">${ph("All")}${types3(ASTAT)}</select></label><label>Priority<select id="f_pri">${ph("All")}${types3(PRI)}</select></label></div>
+    <div class="table-wrap"><table><thead><tr><th>Incident</th><th>Type</th><th>Description</th><th>Requirements</th><th>Responsible</th><th>Target</th><th>Priority</th><th>Status</th></tr></thead><tbody id="rows"></tbody></table></div>
+    <p>Track progress on the <a href="#actmon">Action Monitoring</a> page.</p>`;
+  const render = async () => {
+    const s = $("#f_st").value, p = $("#f_pri").value;
+    const rows = (await DB.all("actions")).filter(a => (!s || a.status === s) && (!p || a.priority === p)).reverse();
+    $("#rows").innerHTML = rows.map(a => `<tr><td>${esc(inc[a.incident_id]?.incident_no)}</td><td>${esc(a.action_type)}</td><td>${esc(a.description)}</td><td>${esc(a.requirements) || "—"}</td><td>${esc(un[a.assigned_to]?.full_name)}</td>
+      <td>${fmtD(a.due_date)} ${!DONE.includes(a.status) && a.due_date < today() ? bd("Overdue") : ""}</td><td>${bd(a.priority)}</td><td>${bd(a.status)}</td></tr>`).join("") || '<tr><td colspan="8">No actions found.</td></tr>';
+  };
+  I = render;
+  CH.a_inv = () => { // show the findings the action is based on
+    const id = val("a_inv"), v = vn[id];
+    $("#basis").innerHTML = !v ? "" : `<div class="card"><h4>Basis: findings &amp; root cause</h4>${finds.filter(f => f.investigation_id == id).map(f =>
+      `<p><b>Root cause:</b> ${esc(f.root_cause) || "—"} · <b>Recommendation:</b> ${esc(f.recommendation) || "—"}</p>`).join("")}${v.rca ? `<p><b>RCA root cause:</b> ${esc(v.rca.root)} · <b>Preventive measures:</b> ${esc(v.rca.prevent) || "—"}</p>` : ""}</div>`;
+  };
+  S.aform = async f => {
+    const err = [];
+    if (!val("a_inv")) err.push("Investigation is required");
+    if (!val("a_type")) err.push("Action type is required");
+    if (!val("a_who")) err.push("Responsible person is required");
+    if (!val("a_desc")) err.push("Action description is required");
+    if (!val("a_req")) err.push("Action requirements are required");
+    if (!val("a_pri")) err.push("Priority is required");
+    if (!val("a_due")) err.push("Target date is required"); else if (val("a_due") < today()) err.push("Target date cannot be in the past");
+    if (err.length) return msg(err.join(". ") + ".", false);
+    const v = vn[val("a_inv")], n = inc[v.incident_id];
+    const id = await DB.add("actions", { investigation_id: v.id, incident_id: v.incident_id, action_type: val("a_type"), description: val("a_desc"), requirements: val("a_req"),
+      assigned_to: +val("a_who"), assigned_by: ME.id, assigned_at: nowISO(), due_date: val("a_due"), priority: val("a_pri"), status: "Pending", completion_date: null, remarks: "" });
+    await DB.add("action_monitoring", { action_id: id, from_status: null, to_status: "Pending", remarks: "Action assigned", changed_by: ME.id, changed_at: nowISO() });
+    await DB.add("notifications", { user_id: +val("a_who"), incident_id: v.incident_id, action_id: id, message: `You were assigned a ${val("a_type")} for ${n.incident_no} (due ${val("a_due")}, ${val("a_pri")} priority).`, is_read: false, created_at: nowISO() });
+    await audit("actions", id, "create", val("a_type")); msg("Action saved; responsible person notified."); f.reset(); $("#basis").innerHTML = ""; render();
+  };
+  render();
+};
+
+/* Lab 22 — Action monitoring (Pending → In Progress → Completed → Verified) */
+PAGES.actmon = async () => {
+  const [users, incs] = await Promise.all(["users", "incidents"].map(s => DB.all(s))), un = byId(users), inc = byId(incs);
+  app().innerHTML = `<div class="card grid flt"><label>Status<select id="f_st">${ph("All")}${types3(ASTAT)}</select></label>
+    <label>Responsible<select id="f_who">${ph("All")}${opts(users, "full_name")}</select></label><label><input type="checkbox" id="f_mine"> My actions only</label></div>
+    <div class="table-wrap"><table><thead><tr><th>Incident</th><th>Action</th><th>Responsible</th><th>Deadline</th><th>Completion date</th><th>Status</th><th>Remarks</th><th></th></tr></thead><tbody id="rows"></tbody></table></div><div id="detail"></div>`;
+  const allowed = a => NEXT[a.status] && (NEXT[a.status] === "Verified" ? can("inv") : (can("inv") || a.assigned_to === ME.id));
+  const render = async () => {
+    const s = $("#f_st").value, w = $("#f_who").value, mine = $("#f_mine").checked;
+    const rows = (await DB.all("actions")).filter(a => (!s || a.status === s) && (!w || a.assigned_to == w) && (!mine || a.assigned_to === ME.id)).reverse();
+    $("#rows").innerHTML = rows.map(a => `<tr><td>${esc(inc[a.incident_id]?.incident_no)}</td><td><b>${esc(a.action_type)}</b><br>${esc(a.description)}</td><td>${esc(un[a.assigned_to]?.full_name)}</td>
+      <td>${fmtD(a.due_date)} ${!DONE.includes(a.status) && a.due_date < today() ? bd("Overdue") : ""}</td><td>${fmtD(a.completion_date)}</td><td>${bd(a.status)}</td><td>${esc(a.remarks) || "—"}</td>
+      <td>${allowed(a) ? `<button class="sec" data-a="advAct" data-id="${a.id}">Move to ${NEXT[a.status]}</button> ` : ""}<button class="sec" data-a="hist" data-id="${a.id}">History</button></td></tr>`).join("") || '<tr><td colspan="8">No actions found.</td></tr>';
+  };
+  I = render;
+  A.advAct = async id => {
+    const a = await DB.get("actions", id), next = NEXT[a.status];
+    if (!next || !allowed(a)) return msg("You are not authorized to update this action.", false);
+    const remarks = prompt(`Remarks for moving to "${next}" (optional):`); if (remarks === null) return;
+    const from = a.status; a.status = next;
+    if (next === "Completed") a.completion_date = today();
+    if (next === "Verified") { a.verified_by = ME.id; a.verified_date = today(); }
+    if (remarks.trim()) a.remarks = remarks.trim();
+    await DB.put("actions", a);
+    await DB.add("action_monitoring", { action_id: a.id, from_status: from, to_status: next, remarks: remarks.trim(), changed_by: ME.id, changed_at: nowISO() });
+    await audit("actions", a.id, "status", next);
+    if (next === "Completed" && a.assigned_by && a.assigned_by !== ME.id)
+      await DB.add("notifications", { user_id: a.assigned_by, incident_id: a.incident_id, action_id: a.id, message: `${ME.full_name} completed "${a.action_type}" for ${inc[a.incident_id]?.incident_no}. Please verify.`, is_read: false, created_at: nowISO() });
+    msg(`Action moved to ${next}.`); render(); drawNav();
+  };
+  A.hist = async id => {
+    const h = await DB.byIndex("action_monitoring", "action_id", Number(id));
+    $("#detail").innerHTML = `<div class="card"><h3>Status history</h3><div class="table-wrap"><table><thead><tr><th>When</th><th>From</th><th>To</th><th>By</th><th>Remarks</th></tr></thead><tbody>${h.map(x =>
+      `<tr><td>${fmtD(x.changed_at)}</td><td>${x.from_status ? bd(x.from_status) : "—"}</td><td>${bd(x.to_status)}</td><td>${esc(un[x.changed_by]?.full_name)}</td><td>${esc(x.remarks) || "—"}</td></tr>`).join("") || '<tr><td colspan="5">No history.</td></tr>'}</tbody></table></div></div>`;
+    $("#detail").scrollIntoView();
+  };
+  render();
+};
+
+/* Lab 23 — Overdue actions: today > target date AND status not Completed (Verified counts as completed) */
+PAGES.overdue = async () => {
+  const [acts, users, incs] = await Promise.all(["actions", "users", "incidents"].map(s => DB.all(s))), un = byId(users), inc = byId(incs), t = today();
+  const rows = acts.filter(a => a.due_date < t && !DONE.includes(a.status)).map(a => ({ a, d: Math.round((Date.parse(t) - Date.parse(a.due_date)) / 864e5) })).sort((x, y) => y.d - x.d);
+  app().innerHTML = `<p>Today is ${esc(t)}. <b>${rows.length}</b> action(s) are overdue (target date passed and not yet completed).</p>
+    <div class="table-wrap"><table><thead><tr><th>Incident</th><th>Action</th><th>Responsible</th><th>Due date</th><th>Days overdue</th><th>Priority</th><th>Status</th></tr></thead><tbody>${rows.map(({ a, d }) =>
+      `<tr><td>${esc(inc[a.incident_id]?.incident_no)}</td><td><b>${esc(a.action_type)}</b><br>${esc(a.description)}</td><td>${esc(un[a.assigned_to]?.full_name)}</td><td>${fmtD(a.due_date)}</td><td>${bd(d + " day" + (d === 1 ? "" : "s"), "Overdue")}</td><td>${bd(a.priority)}</td><td>${bd(a.status)}</td></tr>`).join("") || '<tr><td colspan="7">No overdue actions.</td></tr>'}</tbody></table></div>`;
+};
+
+/* Labs 24-26 — Resolution & closure (shared review helpers) */
+async function reviewData(incId) {
+  const i = await DB.get("incidents", incId), users = byId(await DB.all("users"));
+  const [rep, loc, cat, type] = await Promise.all([DB.get("reporters", i.reporter_id), i.location_id ? DB.get("locations", i.location_id) : null, DB.get("incident_categories", i.category_id), DB.get("incident_types", i.type_id)]);
+  const inv = (await DB.byIndex("investigations", "incident_id", i.id))[0];
+  const finds = inv ? await DB.byIndex("investigation_findings", "investigation_id", inv.id) : [];
+  const acts = await DB.byIndex("actions", "incident_id", i.id), res = (await DB.byIndex("resolutions", "incident_id", i.id))[0];
+  const checks = [["Incident has an investigation", !!inv], ["Investigation is completed", inv?.status === "Completed"],
+    ["Corrective actions exist and all are completed", acts.length > 0 && acts.every(a => DONE.includes(a.status))]];
+  return { i, rep, loc, cat, type, inv, finds, acts, res, users, checks };
+}
+function reviewHTML(d) {
+  const { i, rep, loc, cat, type, inv, finds, acts, res, users, checks } = d;
+  return `<div class="card"><h3>${esc(i.incident_no)} ${bd(i.severity)} ${bd(i.status)}</h3>
+    <p><b>Reporter:</b> ${esc(rep?.full_name)} · <b>Category/Type:</b> ${esc(cat?.name)} / ${esc(type?.name)} · <b>Location:</b> ${esc(loc?.name) || "—"} · <b>When:</b> ${esc(i.incident_date)} ${esc(i.incident_time)}</p>
+    <p><b>Description:</b> ${esc(i.description)}</p>
+    <h4>Investigation</h4>${inv ? `<p>${bd(inv.status)} · Investigator: ${esc(users[inv.investigator_id]?.full_name)} · Deadline ${fmtD(inv.target_date)} · Completed ${fmtD(inv.end_date)}</p>
+      <div class="table-wrap"><table><thead><tr><th>Findings</th><th>Root cause</th><th>Recommendation</th></tr></thead><tbody>${finds.map(f => `<tr><td>${esc(f.finding)}</td><td>${esc(f.root_cause)}</td><td>${esc(f.recommendation)}</td></tr>`).join("") || '<tr><td colspan="3">No findings.</td></tr>'}</tbody></table></div>
+      ${inv.rca ? `<p><b>RCA:</b> ${esc(inv.rca.problem)} → <b>Root cause:</b> ${esc(inv.rca.root)}</p>` : ""}` : "<p>No investigation.</p>"}
+    <h4>Corrective actions</h4><div class="table-wrap"><table><thead><tr><th>Action</th><th>Responsible</th><th>Due</th><th>Completed</th><th>Status</th></tr></thead><tbody>${acts.map(a =>
+      `<tr><td>${esc(a.action_type)}: ${esc(a.description)}</td><td>${esc(users[a.assigned_to]?.full_name)}</td><td>${fmtD(a.due_date)}</td><td>${fmtD(a.completion_date)}</td><td>${bd(a.status)}</td></tr>`).join("") || '<tr><td colspan="5">No actions.</td></tr>'}</tbody></table></div>
+    ${res ? `<h4>Resolution</h4><p><b>${esc(res.type)}</b> on ${fmtD(res.resolution_date)} by ${esc(users[res.resolved_by]?.full_name)}<br>${esc(res.description)}<br><b>Remarks:</b> ${esc(res.remarks) || "—"}
+      ${res.doc_data ? `<br><b>Document:</b> <a href="${res.doc_data}" download="${esc(res.doc_name)}">${esc(res.doc_name)}</a>` : ""}
+      ${res.closure_date ? `<br><b>Closed:</b> ${fmtD(res.closure_date)} by ${esc(users[res.closed_by]?.full_name)} — ${esc(res.closure_remarks) || "no remarks"}` : ""}</p>` : ""}
+    <h4>Readiness checks</h4><ul class="checks">${checks.map(([t, ok]) => `<li class="${ok ? "ok" : "fail"}">${ok ? "✔" : "✘"} ${t}</li>`).join("")}</ul></div>`;
+}
+
+/* Labs 24-25 — Record resolution (with validation) */
+PAGES.resolutions = async () => {
+  const [incs, ress, users] = await Promise.all(["incidents", "resolutions", "users"].map(s => DB.all(s))), un = byId(users), inc = byId(incs);
+  const done = new Set(ress.map(r => r.incident_id)), pending = incs.filter(i => !done.has(i.id) && i.status !== "Closed");
+  app().innerHTML = `<form id="resform"><h3>Record Resolution</h3><div class="grid">
+    <label>Incident *<select id="r_inc">${ph("-- Select incident --")}${opts(pending, i => `${i.incident_no} (${i.status})`)}</select></label>
+    <label>Resolution Type *<select id="r_type">${ph("-- Select --")}${types3(RTYPES)}</select></label>
+    <label>Resolution Date *<input type="date" id="r_date" value="${today()}" max="${today()}"></label>
+    <label>Supporting Document (max 2 MB)<input type="file" id="r_file"></label></div>
+    <label>Resolution Description *<textarea id="r_desc" rows="3"></textarea></label><label>Remarks<textarea id="r_rem" rows="2"></textarea></label>
+    <button>Save Resolution</button></form><div id="review"></div>
+    <h3>Recorded Resolutions</h3><div class="table-wrap"><table><thead><tr><th>Incident</th><th>Type</th><th>Date</th><th>Resolved by</th><th>Remarks</th><th>Document</th><th>Incident status</th></tr></thead><tbody>${ress.map(r =>
+      `<tr><td>${esc(inc[r.incident_id]?.incident_no)}</td><td>${esc(r.type)}</td><td>${fmtD(r.resolution_date)}</td><td>${esc(un[r.resolved_by]?.full_name)}</td><td>${esc(r.remarks) || "—"}</td>
+      <td>${r.doc_data ? `<a href="${r.doc_data}" download="${esc(r.doc_name)}">${esc(r.doc_name)}</a>` : "—"}</td><td>${bd(inc[r.incident_id]?.status || "")}</td></tr>`).join("") || '<tr><td colspan="7">No resolutions yet.</td></tr>'}</tbody></table></div>`;
+  CH.r_inc = async () => { $("#review").innerHTML = val("r_inc") ? reviewHTML(await reviewData(val("r_inc"))) : ""; };
+  S.resform = async () => {
+    const err = [], incId = val("r_inc"), date = val("r_date");
+    if (!incId) err.push("Incident is required");
+    if (!val("r_type")) err.push("Resolution type is required");
+    if (!val("r_desc")) err.push("Resolution description is required");
+    if (!date) err.push("Resolution date is required"); else if (date > today()) err.push("Resolution date cannot be in the future");
+    const file = $("#r_file").files[0]; if (file && file.size > MAXF) err.push("Document is too large (max 2 MB)");
+    let d = null;
+    if (incId) {
+      d = await reviewData(incId);
+      if (d.res) err.push("This incident already has a resolution");
+      if (!d.inv) err.push("Incident must have an investigation");
+      else if (d.inv.status !== "Completed") err.push("Investigation must be completed");
+      if (!d.acts.length) err.push("At least one corrective action must exist");
+      else if (!d.acts.every(a => DONE.includes(a.status))) err.push("All required actions must be completed");
+      if (date && date < d.i.incident_date) err.push("Resolution date cannot precede the incident date");
+    }
+    if (err.length) return msg(err.join(". ") + ".", false);
+    const doc = file ? await readFile(file) : null;
+    const id = await DB.add("resolutions", { incident_id: d.i.id, type: val("r_type"), description: val("r_desc"), resolution_date: date, resolved_by: ME.id, remarks: val("r_rem"),
+      doc_name: file?.name || null, doc_type: file?.type || null, doc_data: doc, created_at: nowISO() });
+    d.i.status = "Resolved"; d.i.resolved_date = date; await DB.put("incidents", d.i);
+    await audit("resolutions", id, "create", d.i.incident_no); msg(`Resolution recorded; ${d.i.incident_no} is now Resolved.`); route();
+  };
+};
+
+/* Lab 26 — Incident closure */
+PAGES.closure = async () => {
+  const [incs, ress, users] = await Promise.all(["incidents", "resolutions", "users"].map(s => DB.all(s))), un = byId(users), inc = byId(incs);
+  app().innerHTML = `<p>Review a resolved incident, confirm the resolution and close it. Only authorized users (${PERM.close.join(", ")}) can close incidents.</p>
+    <div class="table-wrap"><table><thead><tr><th>Incident</th><th>Resolution</th><th>Resolution date</th><th>Resolved by</th><th>Closure date</th><th>Status</th><th></th></tr></thead><tbody>${ress.map(r =>
+      `<tr><td>${esc(inc[r.incident_id]?.incident_no)}</td><td>${esc(r.type)}</td><td>${fmtD(r.resolution_date)}</td><td>${esc(un[r.resolved_by]?.full_name)}</td><td>${fmtD(r.closure_date)}</td><td>${bd(inc[r.incident_id]?.status || "")}</td>
+      <td><button class="sec" data-a="review" data-id="${r.incident_id}">Review</button></td></tr>`).join("") || '<tr><td colspan="7">No resolved incidents yet.</td></tr>'}</tbody></table></div><div id="detail"></div>`;
+  A.review = async id => {
+    const d = await reviewData(id);
+    $("#detail").innerHTML = reviewHTML(d) + (d.i.status === "Resolved" ? `<form id="closeform" data-id="${d.i.id}"><h3>Confirm Resolution &amp; Close</h3>
+      <label><input type="checkbox" id="c_ok"> I reviewed the incident, findings, actions and resolution and confirm the resolution.</label>
+      <label>Closure Remarks<textarea id="c_rem" rows="2"></textarea></label><button>Close Incident</button></form>` : "");
+    $("#detail").scrollIntoView();
+  };
+  S.closeform = async f => {
+    const d = await reviewData(f.dataset.id), err = [];
+    if (d.i.status !== "Resolved" || !d.res) err.push("Only resolved incidents can be closed");
+    if (!d.checks.every(c => c[1])) err.push("Investigation and actions must be complete");
+    if (!$("#c_ok").checked) err.push("Please confirm the resolution");
+    if (err.length) return msg(err.join(". ") + ".", false);
+    Object.assign(d.res, { confirmed: true, closure_date: today(), closed_by: ME.id, closure_remarks: val("c_rem") }); await DB.put("resolutions", d.res);
+    d.i.status = "Closed"; d.i.closed_date = today(); await DB.put("incidents", d.i);
+    await audit("incidents", d.i.id, "close", d.i.incident_no); msg(`${d.i.incident_no} has been closed.`); route();
+  };
+};
+
+/* Labs 27-33 — Workflow integration tests + end-to-end trace */
+PAGES.workflow = async q => {
+  const [reps, locs, incs, invs, finds, acts, ress, users, logs] = await Promise.all(["reporters", "locations", "incidents", "investigations", "investigation_findings", "actions", "resolutions", "users", "audit_logs"].map(s => DB.all(s)));
+  const rn = byId(reps), ln = byId(locs), inc = byId(incs), vn = byId(invs), un = byId(users), hasF = new Set(finds.map(f => f.investigation_id));
+  const no = id => inc[id]?.incident_no || "#" + id, okAct = a => DONE.includes(a.status);
+  const tests = [
+    ["27", "Reporter → Incident: every incident stores an existing reporter", incs.filter(i => !rn[i.reporter_id]).map(i => i.incident_no)],
+    ["28", "Incident → Location: every incident has a valid location", incs.filter(i => !ln[i.location_id]).map(i => i.incident_no)],
+    ["29", "Incident → Investigation: every investigation belongs to a reported incident and does not start before the incident date", invs.filter(v => !inc[v.incident_id] || v.start_date < inc[v.incident_id].incident_date).map(v => no(v.incident_id))],
+    ["30", "Investigation → Action: every action is linked to an investigation with recorded findings", acts.filter(a => !hasF.has(a.investigation_id) || vn[a.investigation_id]?.incident_id !== a.incident_id).map(a => `Action #${a.id}`)],
+    ["31", "Action → Resolution: every resolution has a completed investigation and all actions completed; resolved/closed incidents have a resolution", [
+      ...ress.filter(r => { const v = invs.find(x => x.incident_id === r.incident_id), as = acts.filter(a => a.incident_id === r.incident_id); return !v || v.status !== "Completed" || !as.length || !as.every(okAct); }).map(r => no(r.incident_id)),
+      ...incs.filter(i => ["Resolved", "Closed"].includes(i.status) && !ress.some(r => r.incident_id === i.id)).map(i => i.incident_no)]],
+    ["32", "Resolution → Closure: every closed incident has a confirmed resolution closed by an authorized user", incs.filter(i => i.status === "Closed").filter(i => {
+      const r = ress.find(x => x.incident_id === i.id); return !r || !r.confirmed || !r.closure_date || !PERM.close.includes(ROLES[un[r.closed_by]?.role_id]?.name); }).map(i => i.incident_no)]
+  ];
+  app().innerHTML = `<p>These checks run over all saved records and confirm the workflow is connected end to end. Below, you can trace any single incident from reporter to closure.</p>
+    <div class="table-wrap"><table><thead><tr><th>#</th><th>Workflow check</th><th>Result</th><th>Records failing</th></tr></thead><tbody>${tests.map(([, t, bad], n) =>
+      `<tr><td>${n + 1}</td><td>${t}</td><td>${bad.length ? bd("FAIL", "Overdue") : bd("PASS", "Completed")}</td><td>${esc([...new Set(bad)].join(", ")) || "—"}</td></tr>`).join("")}</tbody></table></div>
+    <div class="card"><h3>Incident trace</h3><label>Incident<select id="t_inc">${ph("-- Select incident --")}${opts(incs, i => `${i.incident_no} (${i.status})`)}</select></label></div><div id="trace"></div>`;
+  const step = (ok, title, body) => `<div class="card"><b class="${ok ? "ok" : "fail"}">${ok ? "✔" : "○"}</b> <b>${title}</b><div>${body || "Not yet done."}</div></div>`;
+  CH.t_inc = () => {
+    const i = inc[val("t_inc")]; if (!i) { $("#trace").innerHTML = ""; return; }
+    const r = rn[i.reporter_id], l = ln[i.location_id], v = invs.find(x => x.incident_id === i.id), fs = v ? finds.filter(f => f.investigation_id === v.id) : [];
+    const as = acts.filter(a => a.incident_id === i.id), res = ress.find(x => x.incident_id === i.id);
+    const keys = new Set([`incidents:${i.id}`, ...(v ? [`investigations:${v.id}`] : []), ...as.map(a => `actions:${a.id}`), ...(res ? [`resolutions:${res.id}`] : [])]);
+    const trail = logs.filter(x => keys.has(x.entity + ":" + x.entity_id));
+    $("#trace").innerHTML = `<h3>${esc(i.incident_no)} ${bd(i.severity)} ${bd(i.status)}</h3>
+      ${step(!!r, "1. Reporter registration", r && `${esc(r.full_name)} (${esc(r.reporter_no)}), ${esc(r.reporter_type)} — registered ${fmtD(r.created_at)}`)}
+      ${step(true, "2. Incident reporting", `${esc(i.incident_no)} — ${esc(i.description)} (occurred ${esc(i.incident_date)} ${esc(i.incident_time)}, reported ${fmtD(i.date_reported)})`)}
+      ${step(!!l, "3. Location identification", l && esc(l.name))}
+      ${step(!!v, "4. Investigation assignment", v && `Investigator ${esc(un[v.investigator_id]?.full_name)}, assigned ${fmtD(v.assigned_at)}, deadline ${fmtD(v.target_date)}`)}
+      ${step(v?.status === "Completed", "5. Investigation", v && `${bd(v.status)} started ${fmtD(v.start_date)}, completed ${fmtD(v.end_date)}`)}
+      ${step(fs.length > 0, "6. Findings / root cause", fs.length ? fs.map(f => `${esc(f.finding)} — root cause: ${esc(f.root_cause) || "—"}`).join("<br>") + (v.rca ? `<br><b>RCA root cause:</b> ${esc(v.rca.root)}` : "") : "")}
+      ${step(as.length > 0 && as.every(okAct), "7. Corrective action", as.map(a => `${esc(a.action_type)} — ${esc(un[a.assigned_to]?.full_name)}, due ${fmtD(a.due_date)}, ${bd(a.status)}, completed ${fmtD(a.completion_date)}`).join("<br>"))}
+      ${step(!!res, "8. Resolution", res && `${esc(res.type)} on ${fmtD(res.resolution_date)} by ${esc(un[res.resolved_by]?.full_name)}`)}
+      ${step(i.status === "Closed", "9. Closure", i.status === "Closed" && res && `Closed ${fmtD(res.closure_date)} by ${esc(un[res.closed_by]?.full_name)}`)}
+      <div class="card"><h4>Audit trail</h4><div class="table-wrap"><table><thead><tr><th>When</th><th>User</th><th>Record</th><th>Action</th><th>Details</th></tr></thead><tbody>${trail.map(x =>
+        `<tr><td>${fmtD(x.created_at)}</td><td>${esc(un[x.user_id]?.full_name)}</td><td>${esc(x.entity)} #${x.entity_id}</td><td>${esc(x.action)}</td><td>${esc(x.details)}</td></tr>`).join("") || '<tr><td colspan="5">No audit entries.</td></tr>'}</tbody></table></div></div>`;
+  };
+  const pre = q.get("inc"); if (pre) { $("#t_inc").value = pre; CH.t_inc(); }
+};
+
+/* Sign in + account */
+PAGES.login = async () => {
+  app().innerHTML = `<form id="login" style="max-width:380px"><h3>Sign In</h3><label>Username<input id="l_user" autocomplete="username"></label>
+    <label>Password<input id="l_pass" type="password" autocomplete="current-password"></label><button>Sign In</button>
+    <p style="margin-top:1rem"><small>Demo accounts: admin, investigator1, investigator2, officer1, viewer1. Default password: <b>${esc(DEFAULT_PW)}</b> (change it under My Account).</small></p></form>`;
+  S.login = async () => {
+    const u = (await DB.byIndex("users", "username", val("l_user")))[0];
+    if (!u || !u.active || u.password_hash !== hashPw(u.username, $("#l_pass").value)) return msg("Invalid username or password.", false);
+    ME = u; sessionStorage.setItem("uid", u.id); await audit("users", u.id, "login");
+    const h = location.hash; if (!h || h === "#login") location.hash = "#home"; else route();
+  };
+};
+PAGES.account = async () => {
+  const dept = ME.department_id ? await DB.get("departments", ME.department_id) : null;
+  app().innerHTML = `<div class="card"><h3>${esc(ME.full_name)}</h3><p>Username: ${esc(ME.username)} · Role: ${esc(role())}${dept ? " · " + esc(dept.name) : ""}</p></div>
+    <form id="pwform" style="max-width:380px"><h3>Change Password</h3><label>Current password<input id="p_old" type="password"></label>
+    <label>New password (min. 8 characters)<input id="p_new" type="password"></label><label>Confirm new password<input id="p_new2" type="password"></label><button>Change Password</button></form>`;
+  S.pwform = async f => {
+    const o = $("#p_old").value, n = $("#p_new").value;
+    if (ME.password_hash !== hashPw(ME.username, o)) return msg("Current password is incorrect.", false);
+    if (n.length < 8) return msg("New password must be at least 8 characters.", false);
+    if (n !== $("#p_new2").value) return msg("New passwords do not match.", false);
+    ME = { ...ME, password_hash: hashPw(ME.username, n) }; await DB.put("users", ME); await audit("users", ME.id, "password"); f.reset(); msg("Password changed.");
+  };
+};
+
+/* ---------- 5. ROUTER ---------- */
+/* Write permissions are enforced here for every form/button (and the UI is locked to match), not only hidden in a page. */
+const GUARD_FORMS = { rform: "reg", cform: "reg", tform: "reg", lform: "reg", iform: "report", nform: "inv", fform: "inv", eform: "inv", rcaform: "inv", aform: "inv", resform: "inv", closeform: "close" };
+const GUARD_ACTIONS = { edit: "reg", tog: "reg", editC: "reg", editT: "reg", toggle: "reg", adv: "inv" };
+const G = { read: async id => { const n = await DB.get("notifications", id); if (n.user_id !== ME.id) return; n.is_read = true; await DB.put("notifications", n); route(); } }; // always available
+const run = fn => Promise.resolve().then(fn).catch(x => { console.error(x); msg(x.message || String(x), false); });
+
+function lock() {
+  if (!ME) return;
+  app().querySelectorAll("form").forEach(f => { const p = GUARD_FORMS[f.id]; if (p && !can(p)) f.outerHTML = `<p class="card">Read-only: your role (${esc(role())}) cannot use this form.</p>`; });
+  app().querySelectorAll("[data-a]").forEach(b => { const p = GUARD_ACTIONS[b.dataset.a]; if (p && !can(p)) b.remove(); });
+}
+async function drawNav() {
+  const unread = ME ? (await DB.byIndex("notifications", "user_id", ME.id)).filter(n => !n.is_read).length : 0;
+  const cur = (location.hash.slice(1) || "home").split("?")[0];
+  $("#nav").innerHTML = ME ? LINKS.map(([h, t]) => `<a href="#${h}"${h === cur ? ' class="on" aria-current="page"' : ""}>${esc(t)}</a>`).join("") +
+    `<a href="#account" class="me"><b>${esc(ME.full_name)}</b><small>${esc(role())}</small></a>${unread ? `<a href="#home" class="alert">${unread} unread notification${unread === 1 ? "" : "s"}</a>` : ""}<a href="#" data-logout>Sign out</a>` : "";
+}
+async function route() {
+  const [n0, qs] = (location.hash.slice(1) || "home").split("?");
+  const name = !ME ? "login" : (PAGES[n0] && n0 !== "login" ? n0 : "home");
+  A = {}; S = {}; CH = {}; I = null;
+  $("#title").textContent = TITLES[name] || TITLES.home;
+  document.title = (TITLES[name] || TITLES.home) + " | Incident Reporting System";
+  try { await drawNav(); await PAGES[name](new URLSearchParams(qs || "")); } catch (x) { console.error(x); app().innerHTML = `<p class="card fail">Something went wrong: ${esc(x.message)}</p>`; }
+}
+app().onclick = e => {
+  const b = e.target.closest("[data-a]"); if (!b) return;
+  const k = b.dataset.a, p = GUARD_ACTIONS[k];
+  if (p && !can(p)) return msg("You are not authorized to do that.", false);
+  run(() => (A[k] || G[k])?.(b.dataset.id, b));
+};
+app().onsubmit = e => {
+  e.preventDefault(); const id = e.target.id, p = GUARD_FORMS[id];
+  if (p && !can(p)) return msg("You are not authorized to submit this form.", false);
+  run(() => S[id]?.(e.target));
+};
+app().oninput = e => { if (e.target.closest(".flt")) run(() => I?.(e)); };
+app().onchange = e => run(() => (CH[e.target.id] || CH[e.target.dataset.c])?.(e));
+$("#nav").onclick = e => {
+  if (e.target.dataset.logout === undefined) return;
+  e.preventDefault(); ME = null; sessionStorage.removeItem("uid");
+  if (location.hash === "#login") route(); else location.hash = "#login";
+};
+window.onhashchange = route;
+
+(async function boot() {
+  try {
+    await DB.open(); ROLES = byId(await DB.all("roles"));
+    const uid = Number(sessionStorage.getItem("uid")), u = uid ? await DB.get("users", uid) : null;
+    ME = u && u.active ? u : null;
+    new MutationObserver(lock).observe(app(), { childList: true, subtree: true });
+    route();
+  } catch (x) { app().innerHTML = `<p class="card fail">Database not connected: ${esc(x.message)}</p>`; }
+})();
