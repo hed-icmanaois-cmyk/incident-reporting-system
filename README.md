@@ -117,8 +117,8 @@ Place your exported PDF deliverables inside a `docs/` folder to activate the lin
 
 ## Course & Project Information
 
-- **Subject:** Software Engineering (3rd Year — Final Project)
-- **Developer(s):** `[Your Name / Group Members]`
-- **Section:** `[Your Section]`
-- **Instructor:** `[Instructor Name]`
+- **Subject:** Software Engineering (Computer Science — 3rd Year — Final Project)
+- **Developer(s):** `Ivanne Clarck M. Manaois`
+- **Section:** `CS3 — A`
+- **Instructor:** `Adonis Garces`
 - **Academic Year:** `[2026–2027]`
