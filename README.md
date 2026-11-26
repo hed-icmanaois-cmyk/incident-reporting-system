@@ -92,10 +92,10 @@ The system supports 7 RBAC roles: **Administrator**, **Reporter**, **Incident Of
 
 | Username | Role | Default Password |
 | :--- | :--- | :--- |
-| `admin` | Administrator | `Password1!` |
-| `officer1` | Incident Officer | `Password1!` |
-| `investigator1` | Investigator | `Password1!` |
-| `viewer1` | Management / Viewer | `Password1!` |
+| `admin` | Administrator | `Password` |
+| `officer1` | Incident Officer | `Password` |
+| `investigator1` | Investigator | `Password` |
+| `viewer1` | Management / Viewer | `Password` |
 
 ## End-to-End Demo Scenario
 
